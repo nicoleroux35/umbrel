@@ -402,6 +402,19 @@ export default class Mdadm {
 		return status
 	}
 
+	/**
+	 * Publish array state to the cached inventory after an operation changed it.
+	 *
+	 * Files lists /Raid from getCachedStatus(), which is otherwise only refreshed
+	 * at start and on the periodic tick. Without this, an array mounted or stopped
+	 * by a mutation stays invisible in Files until the next tick — up to
+	 * STATUS_REFRESH_INTERVAL later — and a just-mounted array shows an empty
+	 * /Raid. Best effort: the caller's own result must not fail on a status read.
+	 */
+	async #refreshStatus(): Promise<void> {
+		await this.getStatus().catch(() => {})
+	}
+
 	async detail(device: string): Promise<string> {
 		if (!isValidMdDevice(device)) throw new Error(`Invalid md device: ${device}`)
 		const {stdout} = await $`mdadm --detail ${device}`
@@ -505,6 +518,7 @@ export default class Mdadm {
 		// A new array adds a UUID to mdadm.conf, so the initramfs must be refreshed
 		// for it to assemble in early boot.
 		await this.saveConfig({updateInitramfs: true})
+		await this.#refreshStatus()
 		return {device: target, output: stdout}
 	}
 
@@ -513,28 +527,33 @@ export default class Mdadm {
 		if (!(await fse.pathExists(newDevice))) throw new Error(`Device not found: ${newDevice}`)
 		await $`mdadm --add ${arrayDevice} ${newDevice}`
 		await this.saveConfig()
+		await this.#refreshStatus()
 	}
 
 	async remove(arrayDevice: string, memberDevice: string): Promise<void> {
 		if (!isValidMdDevice(arrayDevice)) throw new Error(`Invalid md device: ${arrayDevice}`)
 		await $`mdadm --remove ${arrayDevice} ${memberDevice}`
 		await this.saveConfig()
+		await this.#refreshStatus()
 	}
 
 	async fail(arrayDevice: string, memberDevice: string): Promise<void> {
 		if (!isValidMdDevice(arrayDevice)) throw new Error(`Invalid md device: ${arrayDevice}`)
 		await $`mdadm --fail ${arrayDevice} ${memberDevice}`
+		await this.#refreshStatus()
 	}
 
 	/** Stop a running array (`mdadm --stop`). Lifecycle stop() stops the monitor. */
 	async stopArray(arrayDevice: string): Promise<void> {
 		if (!isValidMdDevice(arrayDevice)) throw new Error(`Invalid md device: ${arrayDevice}`)
 		await $`mdadm --stop ${arrayDevice}`
+		await this.#refreshStatus()
 	}
 
 	async assembleScan({run = false} = {}): Promise<string> {
 		const args = ['--assemble', '--scan', ...(run ? ['--run'] : [])]
 		const {stdout} = await $`mdadm ${args}`
+		await this.#refreshStatus()
 		return stdout
 	}
 
@@ -574,6 +593,7 @@ export default class Mdadm {
 		this.logger.log(`Growing ${arrayDevice}: ${args.join(' ')}`)
 		const {stdout} = await $`mdadm ${args}`
 		await this.saveConfig()
+		await this.#refreshStatus()
 		return stdout
 	}
 
@@ -676,13 +696,16 @@ export default class Mdadm {
 		const {stdout} = Mdadm.MKFS_NEEDS_CONFIRMATION.has(filesystem)
 			? await $({input: 'y'})`${args} ${device}`
 			: await $`${args} ${device}`
+		// The new filesystem is part of the cached inventory, so publish it before
+		// returning; a caller that formats then mounts must not see a null filesystem.
+		await this.#refreshStatus()
 		return stdout
 	}
 
 	/**
 	 * Mount an array. Returns the mountpoint (under MOUNT_ROOT, survives umbreld restarts).
 	 * Synthetic-ownership filesystems get uid/gid from the umbrel user so files stay writable.
-	 * Persists an /etc/fstab entry so the array is remounted on every boot.
+	 * Records the mount so start() replays it after a reboot.
 	 */
 	async mount(device: string, {uid = 1000, gid = 1000}: {uid?: number; gid?: number} = {}): Promise<string> {
 		if (!isValidMdDevice(device)) throw new Error(`Invalid md device: ${device}`)
@@ -702,6 +725,9 @@ export default class Mdadm {
 		await fse.ensureDir(mountpoint)
 		await $`mount -t ${fstype} -o ${options.join(',')} ${device} ${mountpoint}`
 		await this.#persistMount(device, fstype, mountpoint, options)
+		// Publish the mount so Files shows the array under /Raid immediately rather
+		// than on the next inventory tick.
+		await this.#refreshStatus()
 		return mountpoint
 	}
 
@@ -722,6 +748,8 @@ export default class Mdadm {
 			throw error
 		})
 		await this.#removePersistedMount(device, mountpoint)
+		// Drop the array from Files' /Raid listing right away.
+		await this.#refreshStatus()
 	}
 
 	/**
