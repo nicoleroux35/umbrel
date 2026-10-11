@@ -88,12 +88,16 @@ describe('mdadm Linux RAID arrays', () => {
 	})
 
 	test('formats the array as ext4 and mounts it', async () => {
-		const output = await umbreld.client.hardware.mdadm.format.mutate({
+		await umbreld.client.hardware.mdadm.format.mutate({
 			arrayDevice: '/dev/md0',
 			filesystem: 'ext4',
 			label: 'umbrel-raid',
 		})
-		expect(output).toContain('ext4')
+
+		// format() returns the mkfs tool's own log, which names the tool
+		// ("mke2fs") rather than the filesystem, so assert the outcome.
+		const filesystem = await umbreld.client.hardware.mdadm.getFilesystemType.query({arrayDevice: '/dev/md0'})
+		expect(filesystem).toBe('ext4')
 
 		const mountpoint = await umbreld.client.hardware.mdadm.mount.mutate({arrayDevice: '/dev/md0'})
 		expect(mountpoint).toBe('/run/mdadm/umbrel-raid')

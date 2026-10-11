@@ -770,9 +770,13 @@ export default class Mdadm {
 	}
 
 	async #getFilesystemType(device: string): Promise<MdadmFilesystem | null> {
-		const {stdout, exitCode} = await $({reject: false})`lsblk --noheadings --nodeps --output FSTYPE ${device}`
+		// Probe the device directly. `lsblk` takes FSTYPE from the udev database,
+		// which is only refreshed asynchronously after mkfs, so it still reports
+		// nothing for a filesystem written a moment ago — and the format-then-mount
+		// flow mounts immediately. `blkid` reads the device itself and sees it.
+		const {stdout, exitCode} = await $({reject: false})`blkid -s TYPE -o value ${device}`
 		if (exitCode !== 0) return null
-		const fstype = stdout.trim()
+		const fstype = stdout.trim().split('\n')[0].trim()
 		return isMdadmFilesystem(fstype) ? fstype : null
 	}
 
