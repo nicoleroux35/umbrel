@@ -13,9 +13,80 @@ function kelvinToCelsius(kelvin: number): number {
 	return kelvin - 273
 }
 
+// Transports of disks we can manage as internal storage. SAS covers both SAS
+// HDDs and SAS SSDs attached to a host bus adapter.
+export const SUPPORTED_INTERNAL_TRANSPORTS = ['nvme', 'sata', 'sas'] as const
+export type StorageTransport = (typeof SUPPORTED_INTERNAL_TRANSPORTS)[number]
+export type HddTransport = Exclude<StorageTransport, 'nvme'>
+
+// SAS and hardware RAID host bus adapter drivers. lsblk can't always label a
+// disk's transport: virtual drives behind a RAID-mode controller (e.g. a
+// MegaRAID card) report no transport at all, so a disk is also treated as
+// internal SAS storage when it sits behind one of these adapters.
+export const SAS_CONTROLLER_DRIVERS = new Set([
+	'megaraid_sas',
+	'megaraid',
+	'mpt3sas',
+	'mpt2sas',
+	'mptsas',
+	'aacraid',
+	'hpsa',
+	'isci',
+	'pm80xx',
+	'mvsas',
+	'mvumi',
+	'smartpqi',
+])
+
+export function isSupportedInternalTransport(tran: string | null | undefined): tran is StorageTransport {
+	return tran !== null && tran !== undefined && (SUPPORTED_INTERNAL_TRANSPORTS as readonly string[]).includes(tran)
+}
+
+export function isSasControllerDriver(driver: string | null | undefined): boolean {
+	return !!driver && SAS_CONTROLLER_DRIVERS.has(driver.trim().toLowerCase())
+}
+
+// Resolve how a disk is attached, or undefined when it isn't internal storage.
+// An unlabelled disk on a SAS/RAID adapter is SAS by definition.
+export function resolveStorageTransport({
+	tran,
+	hostDriver,
+}: {
+	tran?: string | null
+	hostDriver?: string | null
+}): StorageTransport | undefined {
+	if (isSupportedInternalTransport(tran)) return tran
+	if (isSasControllerDriver(hostDriver)) return 'sas'
+	return undefined
+}
+
+// Fallback name for disks that report no model, e.g. some SAS enclosures.
+export function getDefaultStorageDeviceName(transport: StorageTransport): string {
+	if (transport === 'nvme') return 'Unknown NVMe Device'
+	if (transport === 'sas') return 'Unknown SAS Device'
+	return 'Unknown SATA Device'
+}
+
+type SmartLike = {
+	temperature?: {current?: number}
+	smart_status?: {passed?: boolean}
+	nvme_smart_health_information_log?: {percentage_used?: number}
+	scsi_percentage_used_endurance_indicator?: number
+}
+
+// Endurance used by SSDs. NVMe reports it in its SMART health log, SAS/SCSI
+// SSDs in the Solid State Media log page.
+export function getSmartLifetimeUsed(data: SmartLike): number | undefined {
+	const nvmeUsed = data.nvme_smart_health_information_log?.percentage_used
+	if (typeof nvmeUsed === 'number') return nvmeUsed
+	const scsiUsed = data.scsi_percentage_used_endurance_indicator
+	if (typeof scsiUsed === 'number') return scsiUsed
+	return undefined
+}
+
 export type SsdDevice = {
 	type: 'ssd'
-	transport: 'nvme' | 'sata'
+	transport: StorageTransport
 	device: string
 	id?: string
 	pciSlotNumber?: number
@@ -35,7 +106,7 @@ export type SsdDevice = {
 
 export type HddDevice = {
 	type: 'hdd'
-	transport: 'sata'
+	transport: HddTransport
 	device: string
 	id?: string
 	slot?: number
@@ -68,17 +139,13 @@ async function getSmartData(devicePath: string): Promise<SmartData> {
 		const {stdout} = await $({reject: false})`smartctl -a ${devicePath} --json`
 		const data = JSON.parse(stdout)
 
-		// Temperature is reported directly in Celsius
+		// Temperature is reported directly in Celsius for every transport
 		let temperature: number | undefined
 		if (typeof data.temperature?.current === 'number') {
 			temperature = data.temperature.current
 		}
 
-		// NVMe drives report percentage_used in their SMART health log
-		let lifetimeUsed: number | undefined
-		if (typeof data.nvme_smart_health_information_log?.percentage_used === 'number') {
-			lifetimeUsed = data.nvme_smart_health_information_log.percentage_used
-		}
+		const lifetimeUsed = getSmartLifetimeUsed(data)
 
 		// Overall health assessment
 		const smartStatus = data.smart_status?.passed === false ? 'unhealthy' : 'healthy'
@@ -178,6 +245,23 @@ async function getDevicePciSlotNumber(deviceName: string): Promise<number | unde
 	return undefined
 }
 
+// Read the SCSI host driver (proc_name) backing a block device, e.g.
+// "megaraid_sas" for a virtual drive on a MegaRAID card or "mpt3sas" for a
+// disk on a SAS HBA. Returns undefined for devices that aren't on a SCSI host.
+async function getScsiHostDriver(deviceName: string): Promise<string | undefined> {
+	try {
+		// /sys/block/<dev>/device resolves to the SCSI device, whose name is
+		// <host>:<channel>:<target>:<lun>.
+		const scsiDevice = await fse.realpath(`/sys/block/${deviceName}/device`)
+		const hostNumber = nodePath.basename(scsiDevice).split(':')[0]
+		if (!/^\d+$/.test(hostNumber)) return undefined
+		const procName = await fse.readFile(`/sys/class/scsi_host/host${hostNumber}/proc_name`, 'utf8')
+		return procName.trim() || undefined
+	} catch {
+		return undefined
+	}
+}
+
 // Get all internal storage devices using lsblk and nvme commands
 export async function getInternalStorageDevices(): Promise<StorageDevice[]> {
 	type LsBlkDevice = {
@@ -193,20 +277,31 @@ export async function getInternalStorageDevices(): Promise<StorageDevice[]> {
 	const {stdout} = await $`lsblk --output NAME,MODEL,SERIAL,SIZE,TYPE,TRAN,ROTA --json --bytes`
 	const {blockdevices} = JSON.parse(stdout) as {blockdevices: LsBlkDevice[]}
 
-	// Filter to internal disk devices by transport protocol
-	const supportedTransports = ['nvme', 'sata']
-	const internalBlockDevices = blockdevices.filter(
-		(device) => device.type === 'disk' && supportedTransports.includes(device.tran ?? ''),
-	)
+	// Filter to internal disk devices. A disk qualifies when lsblk reports a
+	// supported transport, or when it sits behind a SAS/RAID adapter whose
+	// transport lsblk can't classify (e.g. a hardware RAID virtual drive).
+	const internalBlockDevices = (
+		await Promise.all(
+			blockdevices
+				.filter((device) => device.type === 'disk')
+				.map(async (device) => {
+					const hostDriver = isSupportedInternalTransport(device.tran)
+						? undefined
+						: await getScsiHostDriver(device.name)
+					const transport = resolveStorageTransport({tran: device.tran, hostDriver})
+					return transport ? {device, transport} : undefined
+				}),
+		)
+	).filter((entry): entry is {device: LsBlkDevice; transport: StorageTransport} => entry !== undefined)
 
 	// Fetch SMART data, device IDs, and PCIe slot numbers for all devices in parallel
 	const devices: StorageDevice[] = await Promise.all(
-		internalBlockDevices.map(async (device): Promise<StorageDevice> => {
+		internalBlockDevices.map(async ({device, transport}): Promise<StorageDevice> => {
 			const devicePath = `/dev/${device.name}`
 			const id = await getDeviceId(device.name).catch(() => undefined)
 			const size = device.size ?? 0
-			const isNvme = device.tran === 'nvme'
-			const name = device.model?.trim() ?? (isNvme ? 'Unknown NVMe Device' : 'Unknown SATA Device')
+			const isNvme = transport === 'nvme'
+			const name = device.model?.trim() ?? getDefaultStorageDeviceName(transport)
 			const model = device.model?.trim() ?? 'Unknown'
 			const serial = device.serial?.trim() ?? 'Unknown'
 			const roundedSize = getRoundedDeviceSize(size)
@@ -223,7 +318,7 @@ export async function getInternalStorageDevices(): Promise<StorageDevice[]> {
 			if (isSsd) {
 				return {
 					type: 'ssd' as const,
-					transport: device.tran as 'nvme' | 'sata',
+					transport,
 					device: device.name,
 					id,
 					pciSlotNumber,
@@ -242,7 +337,8 @@ export async function getInternalStorageDevices(): Promise<StorageDevice[]> {
 
 			return {
 				type: 'hdd' as const,
-				transport: 'sata' as const,
+				// An NVMe transport always classifies as an SSD above.
+				transport: transport as HddTransport,
 				device: device.name,
 				id,
 				name,
