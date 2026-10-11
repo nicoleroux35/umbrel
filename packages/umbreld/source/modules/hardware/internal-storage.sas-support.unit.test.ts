@@ -3,8 +3,10 @@ import {describe, test, expect} from 'vitest'
 import {
 	getDefaultStorageDeviceName,
 	getSmartLifetimeUsed,
+	isControllerSmartctlType,
 	isSasControllerDriver,
 	isSupportedInternalTransport,
+	resolveSmartctlDeviceType,
 	resolveStorageTransport,
 } from './internal-storage.js'
 
@@ -88,5 +90,41 @@ describe('SMART endurance', () => {
 
 	test('returns undefined when the drive reports no endurance', () => {
 		expect(getSmartLifetimeUsed({})).toBeUndefined()
+	})
+})
+
+describe('smartctl device types for controller-attached disks', () => {
+	test('recognises RAID controller types that need an explicit -d', () => {
+		for (const type of ['megaraid,1', 'sat+megaraid,1', 'aacraid,0,0,0', 'cciss,0', '3ware,0', 'areca,1', 'hpt,1']) {
+			expect(isControllerSmartctlType(type)).toBe(true)
+		}
+	})
+
+	test('does not force -d for directly attached transports', () => {
+		for (const type of ['ata', 'scsi', 'nvme', 'sat', 'usb', '', null, undefined]) {
+			expect(isControllerSmartctlType(type)).toBe(false)
+		}
+	})
+
+	test('reads the scan type for a disk behind a RAID controller', () => {
+		const scan = [
+			{name: '/dev/sda', type: 'megaraid,1', protocol: 'SCSI'},
+			{name: '/dev/nvme0n1', type: 'nvme', protocol: 'NVMe'},
+		]
+		expect(resolveSmartctlDeviceType(scan, '/dev/sda')).toBe('megaraid,1')
+	})
+
+	test('leaves directly attached disks on autodetection', () => {
+		const scan = [
+			{name: '/dev/sda', type: 'ata', protocol: 'ATA'},
+			{name: '/dev/sdb', type: 'scsi', protocol: 'SCSI'},
+		]
+		expect(resolveSmartctlDeviceType(scan, '/dev/sda')).toBeUndefined()
+		expect(resolveSmartctlDeviceType(scan, '/dev/sdb')).toBeUndefined()
+	})
+
+	test('returns undefined for devices the scan does not report', () => {
+		expect(resolveSmartctlDeviceType([{name: '/dev/sda', type: 'megaraid,0'}], '/dev/sdb')).toBeUndefined()
+		expect(resolveSmartctlDeviceType([], '/dev/sda')).toBeUndefined()
 	})
 })

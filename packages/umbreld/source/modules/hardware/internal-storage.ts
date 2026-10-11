@@ -84,6 +84,35 @@ export function getSmartLifetimeUsed(data: SmartLike): number | undefined {
 	return undefined
 }
 
+export type SmartctlScanDevice = {
+	name?: string
+	type?: string
+	protocol?: string
+}
+
+// smartctl device types that address a disk through a hardware RAID
+// controller rather than directly. A MegaRAID virtual drive is read as
+// `-d megaraid,1`, an AACRAID disk as `-d aacraid,H,L,ID`, a cciss/3ware/areca
+// disk similarly. Plain transports (nvme, sata, and SAS disks on a host bus
+// adapter) are autodetected reliably and never need an explicit type.
+const CONTROLLER_SMARTCTL_TYPES = /megaraid|aacraid|cciss|3ware|areca|hpt|pm80xx|mvsas|smartpqi/i
+
+export function isControllerSmartctlType(type: string | null | undefined): boolean {
+	return !!type && CONTROLLER_SMARTCTL_TYPES.test(type)
+}
+
+// Resolve the explicit `-d` type smartctl needs for a block device, or
+// undefined when it can autodetect. `smartctl --scan` is the only reliable
+// source for controller-attached disks: smartctl derives the device index from
+// the controller itself, which we cannot reproduce from sysfs.
+export function resolveSmartctlDeviceType(
+	scanDevices: readonly SmartctlScanDevice[],
+	devicePath: string,
+): string | undefined {
+	const match = scanDevices.find((device) => device.name === devicePath)
+	return isControllerSmartctlType(match?.type) ? match!.type : undefined
+}
+
 export type SsdDevice = {
 	type: 'ssd'
 	transport: StorageTransport
@@ -131,12 +160,15 @@ type SmartData = {
 }
 
 // Get SMART data for any device using smartctl
-async function getSmartData(devicePath: string): Promise<SmartData> {
+// `smartctlType` is the explicit -d type for disks behind a RAID controller
+// (e.g. "megaraid,1"); omit it to let smartctl autodetect.
+async function getSmartData(devicePath: string, smartctlType?: string): Promise<SmartData> {
 	try {
 		// smartctl uses exit code bits as status flags (e.g. bit 2 = SMART attributes failing)
 		// so it can return non-zero even on success. We need to accept any exit code and parse
 		// the JSON output regardless.
-		const {stdout} = await $({reject: false})`smartctl -a ${devicePath} --json`
+		const smartctlArgs = smartctlType ? ['-d', smartctlType] : []
+		const {stdout} = await $({reject: false})`smartctl -a ${devicePath} ${smartctlArgs} --json`
 		const data = JSON.parse(stdout)
 
 		// Temperature is reported directly in Celsius for every transport
@@ -153,6 +185,19 @@ async function getSmartData(devicePath: string): Promise<SmartData> {
 		return {temperature, lifetimeUsed, smartStatus}
 	} catch {
 		return {smartStatus: 'unknown'}
+	}
+}
+
+// List the devices smartctl knows how to talk to, so we can learn the -d type
+// for disks behind a hardware RAID controller. Never throws: on a system
+// without smartctl, or with unparseable output, devices are autodetected.
+async function getSmartctlScanDevices(): Promise<SmartctlScanDevice[]> {
+	try {
+		const {stdout} = await $({reject: false})`smartctl --scan --json`
+		const {devices} = JSON.parse(stdout) as {devices?: SmartctlScanDevice[]}
+		return devices ?? []
+	} catch {
+		return []
 	}
 }
 
@@ -277,6 +322,10 @@ export async function getInternalStorageDevices(): Promise<StorageDevice[]> {
 	const {stdout} = await $`lsblk --output NAME,MODEL,SERIAL,SIZE,TYPE,TRAN,ROTA --json --bytes`
 	const {blockdevices} = JSON.parse(stdout) as {blockdevices: LsBlkDevice[]}
 
+	// Discover how smartctl addresses each disk so we can read SMART from disks
+	// behind a hardware RAID controller, where autodetection alone fails.
+	const smartctlScanDevices = await getSmartctlScanDevices()
+
 	// Filter to internal disk devices. A disk qualifies when lsblk reports a
 	// supported transport, or when it sits behind a SAS/RAID adapter whose
 	// transport lsblk can't classify (e.g. a hardware RAID virtual drive).
@@ -306,7 +355,7 @@ export async function getInternalStorageDevices(): Promise<StorageDevice[]> {
 			const serial = device.serial?.trim() ?? 'Unknown'
 			const roundedSize = getRoundedDeviceSize(size)
 			const [smartData, temperatureThresholds, pciSlotNumber] = await Promise.all([
-				getSmartData(devicePath),
+				getSmartData(devicePath, resolveSmartctlDeviceType(smartctlScanDevices, devicePath)),
 				isNvme
 					? getNvmeTemperatureThresholds(devicePath)
 					: ({} as {temperatureWarning?: number; temperatureCritical?: number}),
