@@ -193,8 +193,8 @@ export default class Files {
 			['/Backups', `${umbreld.dataDirectory}/backups`],
 			['/Network', `${umbreld.dataDirectory}/network`],
 			// Linux RAID (mdadm) arrays are mounted here by the mdadm module.
-			// This is tmpfs: the umbrel-mdadm-mount.service unit recreates the
-			// mounts from /etc/fstab on every boot.
+			// This is tmpfs: umbreld replays the recorded mounts on every start,
+			// since /etc does not survive a reboot.
 			['/Raid', Mdadm.MOUNT_ROOT],
 		])
 
@@ -479,7 +479,7 @@ export default class Files {
 	}
 
 	/**
-	 * Safely unmount a RAID array and drop its persisted fstab entry.
+	 * Safely unmount a RAID array and drop its recorded mount.
 	 * Coordinates the same blocks as ejecting external storage so a data-root
 	 * move can't start after the in-use check and race the unmount.
 	 */

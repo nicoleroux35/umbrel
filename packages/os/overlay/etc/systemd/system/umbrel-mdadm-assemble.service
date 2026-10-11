@@ -9,11 +9,11 @@ Wants=local-fs.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-# Assemble arrays from superblocks / mdadm.conf without blocking boot when
-# no array exists (mdadm exits non-zero in that case).
+# Assemble arrays from superblocks without blocking boot when no array exists
+# (mdadm exits non-zero in that case). Mounting the arrays is umbreld's job: it
+# records the desired mounts in its data directory and replays them on start,
+# because /etc — where an fstab entry would go — does not survive a reboot.
 ExecStart=/bin/sh -c 'mdadm --assemble --scan --run || true'
-# Refresh initramfs view of arrays for the next boot (best effort).
-ExecStart=/bin/sh -c 'mdadm --detail --scan > /etc/mdadm/mdadm.conf || true'
 TimeoutStartSec=120
 
 [Install]

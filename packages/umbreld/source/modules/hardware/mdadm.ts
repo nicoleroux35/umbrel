@@ -101,7 +101,13 @@ export const MDADM_MIN_DEVICES: Record<MdadmLevel, number> = {
 
 export const MDADM_MAX_DEVICE_INDEX = 31
 
-const FSTAB_PATH = '/etc/fstab'
+// Desired array mounts are recorded in the umbreld data directory rather than
+// /etc/fstab. umbrelOS boots a read-only system slot whose overlay upper is not
+// persisted, so a reboot wipes everything written under /etc — including an
+// fstab entry — while the data directory lives on the persisted data partition.
+// start() replays this list so arrays the user had mounted come back at boot.
+const MOUNTS_DIRECTORY = 'mdadm'
+const MOUNTS_FILE = 'mounts'
 
 export function isValidMdDevice(device: string): boolean {
 	return /^\/dev\/md\d+$/.test(device)
@@ -274,6 +280,11 @@ export default class Mdadm {
 		this.logger = umbreld.logger.createChildLogger(`hardware:${name.toLowerCase()}`)
 	}
 
+	/** fstab-format list of the mounts to replay at boot, kept in the data directory. */
+	get #mountsFilePath(): string {
+		return `${this.#umbreld.dataDirectory}/${MOUNTS_DIRECTORY}/${MOUNTS_FILE}`
+	}
+
 	async start() {
 		this.logger.log('Starting mdadm monitor')
 		// Best-effort auto-assemble on every (re)start so arrays defined by
@@ -285,6 +296,13 @@ export default class Mdadm {
 			if (output.trim()) this.logger.log(`mdadm auto-assemble: ${output.trim()}`)
 		} catch (error) {
 			this.logger.error('mdadm auto-assemble at start failed (non-fatal)', error)
+		}
+		// Remount arrays the user had mounted before the reboot. /etc does not
+		// survive it, so this is the only thing that brings the mounts back.
+		try {
+			await this.#restorePersistedMounts()
+		} catch (error) {
+			this.logger.error('mdadm mount replay at start failed (non-fatal)', error)
 		}
 		// Keep the cached inventory warm so Files can list /Raid mounts without
 		// shelling out per request.
@@ -515,8 +533,10 @@ export default class Mdadm {
 		// --run forces creation without interactive confirmation, --metadata=1.2 keeps
 		// 4K alignment friendly superblocks readable by modern installers.
 		const {stdout} = await $({input: 'y'})`mdadm ${args}`
-		// A new array adds a UUID to mdadm.conf, so the initramfs must be refreshed
-		// for it to assemble in early boot.
+		// A new array adds a UUID to mdadm.conf, so the initramfs should be refreshed
+		// for it to assemble in early boot. On umbrelOS the system slot is read-only
+		// at runtime, so this normally fails and the array comes up through mdadm's
+		// udev rule instead; best effort either way.
 		await this.saveConfig({updateInitramfs: true})
 		await this.#refreshStatus()
 		return {device: target, output: stdout}
@@ -715,8 +735,8 @@ export default class Mdadm {
 		const fstype = await this.#getFilesystemType(device)
 		if (!fstype) throw new Error(`No supported filesystem found on ${device}`)
 		const mountpoint = await this.mountpointFor(device)
-		// x-mount.mkdir lets the boot-time `mount -a` recreate the mountpoint on
-		// the tmpfs /run/mdadm (nothing persists there across a reboot).
+		// x-mount.mkdir lets the boot-time replay recreate the mountpoint under the
+		// tmpfs MOUNT_ROOT (nothing persists there across a reboot).
 		const options = [
 			'nofail',
 			'x-mount.mkdir=0755',
@@ -753,56 +773,75 @@ export default class Mdadm {
 	}
 
 	/**
-	 * Persist a mount to /etc/fstab, keyed by filesystem UUID so the entry keeps
-	 * working when the array lands on a different /dev/mdN after reassembly.
-	 * The umbrel-mdadm-mount.service unit replays this list with `mount -a` at boot.
+	 * Record a mount so it is replayed at boot, keyed by filesystem UUID so the
+	 * entry keeps working when the array lands on a different /dev/mdN after
+	 * reassembly. The list is kept in the data directory (see #mountsFilePath),
+	 * never /etc/fstab, which a reboot wipes on umbrelOS.
 	 */
 	async #persistMount(device: string, fstype: MdadmFilesystem, mountpoint: string, options: string[]) {
 		try {
 			const mountSpec = (await this.#getFilesystemUuid(device)) ?? device
-			// x-mount.mkdir lets the boot-time `mount -a` recreate the mountpoint on
-			// the tmpfs /run/mdadm, which is empty after every reboot. mount() already
-			// includes it in the live options, so dedupe before writing fstab.
+			// x-mount.mkdir lets the boot-time replay recreate the mountpoint under
+			// the tmpfs MOUNT_ROOT, which is empty after every reboot. mount() already
+			// includes it in the live options, so dedupe before writing the entry.
 			const fstabOptions = [...new Set([...options, 'x-mount.mkdir=0755'])].join(',')
 			const entry = `UUID=${mountSpec} ${mountpoint} ${fstype} ${fstabOptions} 0 0\n`
-			const existing = await fse.readFile(FSTAB_PATH, 'utf8').catch(() => '')
+			const file = this.#mountsFilePath
+			const existing = await fse.readFile(file, 'utf8').catch(() => '')
 			const lines = existing.split('\n').filter((line) => {
 				if (!line.trim() || line.trim().startsWith('#')) return true
-				return !this.#isRaidFstabLine(line, mountpoint)
+				return !this.#isRaidMountLine(line, mountpoint)
 			})
 			lines.push(entry.trim())
 			const next = `${lines.join('\n').trim()}\n`
 			if (next !== existing) {
-				await fse.ensureFile(FSTAB_PATH)
-				await fse.writeFile(FSTAB_PATH, next)
-				this.logger.log(`Persisted mount '${device}' -> ${mountpoint} to fstab`)
+				await fse.ensureFile(file)
+				await fse.writeFile(file, next)
+				this.logger.log(`Persisted mount '${device}' -> ${mountpoint}`)
 			}
 		} catch (error) {
-			this.logger.error(`Failed to persist fstab entry for ${device}`, error)
+			this.logger.error(`Failed to persist mount for ${device}`, error)
 		}
 	}
 
 	async #removePersistedMount(device: string, mountpoint?: string) {
 		try {
 			const target = mountpoint ?? (await this.mountpointFor(device))
-			const existing = await fse.readFile(FSTAB_PATH, 'utf8').catch(() => '')
+			const file = this.#mountsFilePath
+			const existing = await fse.readFile(file, 'utf8').catch(() => '')
 			const next = existing
 				.split('\n')
-				.filter((line) => !(line.trim() && this.#isRaidFstabLine(line, target)))
+				.filter((line) => !(line.trim() && this.#isRaidMountLine(line, target)))
 				.join('\n')
 			if (next !== existing) {
-				await fse.writeFile(FSTAB_PATH, next)
-				this.logger.log(`Removed persisted mount '${device}' from fstab`)
+				await fse.writeFile(file, next)
+				this.logger.log(`Removed persisted mount '${device}'`)
 			}
 		} catch (error) {
-			this.logger.error(`Failed to remove fstab entry for ${device}`, error)
+			this.logger.error(`Failed to remove persisted mount for ${device}`, error)
 		}
 	}
 
-	// True when an fstab line is an mdadm array mount under MOUNT_ROOT. Matching on
-	// the mountpoint keeps entries findable and removable even after the array's
+	/**
+	 * Remount everything #persistMount recorded. `mount -a -T` reads the list as an
+	 * fstab and skips entries already mounted, so a replay on every umbreld start is
+	 * idempotent. Entries carry `nofail`, so a missing or degraded array is skipped
+	 * rather than failing the whole replay. Runs once per start, by which point the
+	 * boot unit and mdadm's udev rule have assembled the arrays.
+	 */
+	async #restorePersistedMounts(): Promise<void> {
+		const file = this.#mountsFilePath
+		if (!(await fse.pathExists(file))) return
+		const {stdout, stderr, exitCode} = await $({reject: false})`mount -a -T ${file}`
+		if (stdout.trim()) this.logger.log(`mdadm mount replay: ${stdout.trim()}`)
+		if (stderr.trim()) this.logger.log(`mdadm mount replay: ${stderr.trim()}`)
+		if (exitCode !== 0) this.logger.log(`mdadm mount replay exited with code ${exitCode}`)
+	}
+
+	// True when a persisted line is an mdadm array mount under MOUNT_ROOT. Matching
+	// on the mountpoint keeps entries findable and removable even after the array's
 	// /dev/mdN node changes, since the mountpoint derives from the array name.
-	#isRaidFstabLine(line: string, mountpoint?: string): boolean {
+	#isRaidMountLine(line: string, mountpoint?: string): boolean {
 		if (line.trim().startsWith('#')) return false
 		const [spec, target] = line.trim().split(/\s+/)
 		if (!spec || !target) return false

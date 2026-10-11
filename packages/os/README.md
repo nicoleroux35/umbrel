@@ -40,7 +40,7 @@ Added to `umbrelos.Dockerfile` in the *Filessystem support* layer:
 
 | Package | Provides |
 | --- | --- |
-| `mdadm` | `/dev/mdX` arrays, superblock metadata, `mdadm --monitor` |
+| `mdadm` | `/dev/mdX` arrays, superblock metadata, `mdadm --detail` |
 | `btrfs-progs` | `mkfs.btrfs` |
 | `xfsprogs` | `mkfs.xfs` |
 
@@ -49,32 +49,47 @@ The image already had `e2fsprogs` (ext4), `exfatprogs` (exFAT), `dosfstools`
 an array can be formatted with.
 
 The final `update-initramfs -u -k all` in the image picks up mdadm's initramfs
-hook, so arrays that are part of the boot path are available in early boot.
+hook. The initramfs is built at image-build time, though, when no array exists
+yet — and at runtime the system slot (and its initramfs) is read-only, so a
+later-created array never gets a conf baked in. Arrays therefore come up through
+mdadm's udev rule instead, which assembles from the superblocks on whichever
+`/dev/mdN` is free (typically `/dev/md127`). Nothing may depend on a specific
+`/dev/mdN`: identify arrays by the name in their superblock, which is what
+`/Raid/<name>` and the recorded mounts use.
 
 ### Boot ordering
 
 ```mermaid
 graph LR
-    A[umbrel-mdadm-assemble.service] --> B[umbrel-mdadm-mount.service] --> C[umbrel.service]
+    A[umbrel-mdadm-assemble.service] --> B[umbrel.service]
 ```
 
-Both units are `oneshot`, enabled through `multi-user.target.wants`, and declare
-us as ordering only (`After`/`Before`), never as a hard requirement — a host
-without arrays boots exactly as before.
+The unit is `oneshot`, enabled through `multi-user.target.wants`, and declares
+ordering only (`After`/`Before`), never a hard requirement — a host without
+arrays boots exactly as before.
 
 1. **assemble** — `mdadm --assemble --scan --run` brings every array defined by a
-   superblock or `mdadm.conf` back online, then refreshes `/etc/mdadm/mdadm.conf`.
-2. **mount** — `mount -a` replays the desired mounts from `/etc/fstab`, then starts
-   `mdadm --monitor --scan --daemonise` for ongoing event monitoring.
+   superblock back online before umbreld starts, so `/dev/mdX` exist for anything
+   that runs earlier in boot.
+2. **umbreld** — `Mdadm.start()` runs the same best-effort `assemble --scan --run`
+   (so arrays come back in containers and dev environments where the unit never
+   ran) and then replays the recorded mounts, see *Mount persistence* below.
 
-`Mdadm.start()` in umbreld also runs a best-effort `assemble --scan --run`, so
-arrays come back in containers and dev environments where the units never ran.
-The inventory is then polled every 10 seconds into a cache, which is what
-`Files` reads to populate `/Raid` — no shell-out per Files request.
+The inventory is polled every 10 seconds into a cache, which is what `Files`
+reads to populate `/Raid` — no shell-out per Files request.
 
 ### Mount persistence
 
-`mount()` writes one `/etc/fstab` entry per array, keyed by **filesystem UUID**
+umbrelOS boots a **read-only system slot** whose overlay upper is not persisted:
+a reboot wipes everything written under `/etc`, so an `/etc/fstab` entry — and an
+`/etc/mdadm/mdadm.conf` — is gone by the time the next boot reads it. The array
+itself still comes back (mdadm's udev rule assembles it from the superblocks, on
+whichever `/dev/mdN` is free), but nothing remounts it.
+
+So `mount()` records the desired mounts in the **umbreld data directory**
+(`<data-directory>/mdadm/mounts`, i.e. `/home/umbrel/umbrel/mdadm/mounts` on the
+image), which lives on the persisted data partition. `Mdadm.start()` replays that
+file with `mount -a -T <file>` on every start, keyed by **filesystem UUID**
 rather than the device node:
 
 ```
@@ -82,22 +97,23 @@ UUID=<fs-uuid> /run/mdadm/umbrel-md ext4 nofail,x-mount.mkdir=0755 0 0
 UUID=<fs-uuid> /run/mdadm/media exfat nofail,x-mount.mkdir=0755,uid=1000,gid=1000,umask=007 0 0
 ```
 
-- `nofail` means an absent or degraded array is a warning, not a boot failure.
-- UUID survives the array being reassembled onto a different `/dev/mdN`.
+- `nofail` means an absent or degraded array is skipped, not a boot failure.
+- UUID survives the array being reassembled onto a different `/dev/mdN` (a conf
+  naming `/dev/md0` would not: udev's `--incremental` assembles before any
+  systemd unit can install one, so the node is whatever is free at that point).
 - The mountpoint directory is the **array name** from the superblock (sanitised,
   falling back to the device node name), so `/Raid/<name>` and the on-disk mount
   path agree and both survive md device renumbering.
-- `x-mount.mkdir=0755` lets the boot-time `mount -a` recreate the mountpoint
-  directory, since `/run/mdadm` is tmpfs and is empty after every reboot.
+- `x-mount.mkdir=0755` lets the replay recreate the mountpoint directory, since
+  `/run/mdadm` is tmpfs and is empty after every reboot.
 - Native filesystems (ext4/btrfs/xfs) mount bare; synthetic-ownership
   filesystems (exFAT/FAT32/NTFS) carry `uid`/`gid`/`umask` so files stay writable
   by the `umbrel` user, matching `isSyntheticOwnershipFilesystem()` semantics.
+- Replaying is idempotent: `mount -a` skips entries already mounted, so a plain
+  umbreld restart does not remount anything.
 
 `unmount()` removes the entry again. `format()` refuses a mounted device, so an
-array that is fstab-backed cannot be reformatted underneath a live mount.
-
-`/run/mdadm` is tmpfs and is recreated by the mount unit; the array mounts
-themselves only survive a reboot because `/etc/fstab` does.
+array with a recorded mount cannot be reformatted underneath a live mount.
 
 ### Files integration
 
@@ -111,7 +127,7 @@ themselves only survive a reboot because `/etc/fstab` does.
 - Member share categorisation — `/Raid/...` shares report base `raid` instead of
   falling back to `home`.
 - `files.unmountRaidMount()` — blocks apps, machines and Cloud paths, excludes the
-  path from Samba shares, then detaches and drops the fstab entry.
+  path from Samba shares, then detaches and drops the recorded mount.
 
 ### Supported configurations
 

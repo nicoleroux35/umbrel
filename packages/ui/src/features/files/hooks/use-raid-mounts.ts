@@ -14,7 +14,7 @@ export type RaidMount = RouterOutput['files']['raidMounts'][number]
 /**
  * Linux RAID (mdadm) array mounts exposed to Files under /Raid.
  * Arrays are created and managed in Storage Manager; here we can unmount (eject)
- * them safely, which also drops their persisted fstab entry.
+ * them safely, which also drops their recorded mount.
  */
 export function useRaidMounts() {
 	const {t} = useTranslation()

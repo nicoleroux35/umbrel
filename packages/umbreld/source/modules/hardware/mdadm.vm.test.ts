@@ -118,27 +118,45 @@ describe('mdadm Linux RAID arrays', () => {
 		expect(listing.files.some((file) => file.name === 'persistence')).toBe(true)
 	})
 
-	test('persists an fstab entry for the array', async () => {
-		const fstab = await umbreld.vm.sshAsRoot('cat /etc/fstab')
-		expect(fstab).toContain('/run/mdadm/umbrel-raid')
-		expect(fstab).toContain('ext4')
-		// A missing array must never block boot
-		expect(fstab).toContain('nofail')
+	test('records the mount for replay at boot', async () => {
+		const mounts = await umbreld.vm.sshAsRoot('cat /home/umbrel/umbrel/mdadm/mounts')
+		expect(mounts).toContain('/run/mdadm/umbrel-raid')
+		expect(mounts).toContain('ext4')
+		// Keyed by filesystem UUID so the entry keeps working when the array comes
+		// back on a different /dev/mdN, and nofail so a missing array is skipped
+		// rather than failing the replay. A missing array must never block boot.
+		expect(mounts).toContain('UUID=')
+		expect(mounts).toContain('nofail')
 	})
 
 	// --- Phase 3: Data survives a full reboot ---
 
-	test('data survives a reboot (fstab remount)', async () => {
+	// The array's /dev/mdN is not stable across a reboot. umbrelOS has no mdadm in
+	// the initramfs, so mdadm's udev rule assembles from the superblocks before any
+	// systemd unit runs, onto whichever node is free (typically /dev/md127) — a
+	// conf naming /dev/md0 is written too late to change that. Resolve by the array
+	// name from the superblock instead, which is stable and is also what /Raid uses.
+	const arrayDevice = async () => {
+		const status = await umbreld.client.hardware.mdadm.getStatus.query()
+		const array = status.arrays.find((candidate) => candidate.name === 'umbrel-raid')
+		if (!array) throw new Error('umbrel-raid array not found')
+		return array.device
+	}
+
+	test('data survives a reboot (mount replay)', async () => {
 		await umbreld.vm.powerOff()
 		await umbreld.vm.powerOn()
 		await umbreld.login()
 
-		// The array is reassembled before umbreld starts, then remounted from fstab
+		// The array is reassembled before umbreld starts, then remounted by
+		// Mdadm.start() from the list recorded in the data directory.
 		await pWaitFor(
 			async () => {
 				try {
-					const mounts = await umbreld.client.hardware.mdadm.getMountpoint.query({arrayDevice: '/dev/md0'})
-					return mounts !== null
+					const mountpoint = await umbreld.client.hardware.mdadm.getMountpoint.query({
+						arrayDevice: await arrayDevice(),
+					})
+					return mountpoint !== null
 				} catch {
 					return false
 				}
@@ -152,7 +170,7 @@ describe('mdadm Linux RAID arrays', () => {
 
 	test('array stays healthy after the reboot', async () => {
 		const status = await umbreld.client.hardware.mdadm.getStatus.query()
-		const array = status.arrays.find((candidate) => candidate.device === '/dev/md0')
+		const array = status.arrays.find((candidate) => candidate.name === 'umbrel-raid')
 		expect(array).toBeDefined()
 		expect(array!.failedDevices).toBe(0)
 		expect(array!.members.every((member) => member.state === 'active' || member.state === 'sync')).toBe(true)
@@ -162,29 +180,31 @@ describe('mdadm Linux RAID arrays', () => {
 
 	test('grow is rejected on a RAID1 array', async () => {
 		await expect(
-			umbreld.client.hardware.mdadm.growAddAndExpand.mutate({arrayDevice: '/dev/md0', devices: []}),
+			umbreld.client.hardware.mdadm.growAddAndExpand.mutate({arrayDevice: await arrayDevice(), devices: []}),
 		).rejects.toThrow()
 	})
 
 	// --- Phase 5: Unmount detaches cleanly ---
 
-	test('unmounting removes the mount and the fstab entry', async () => {
-		await umbreld.client.hardware.mdadm.unmount.mutate({arrayDevice: '/dev/md0'})
+	test('unmounting removes the mount and the recorded entry', async () => {
+		const device = await arrayDevice()
+		await umbreld.client.hardware.mdadm.unmount.mutate({arrayDevice: device})
 
-		const mountpoint = await umbreld.client.hardware.mdadm.getMountpoint.query({arrayDevice: '/dev/md0'})
+		const mountpoint = await umbreld.client.hardware.mdadm.getMountpoint.query({arrayDevice: device})
 		expect(mountpoint).toBeNull()
 
-		const fstab = await umbreld.vm.sshAsRoot('cat /etc/fstab')
-		expect(fstab).not.toContain('/run/mdadm/umbrel-raid')
+		const mounts = await umbreld.vm.sshAsRoot('cat /home/umbrel/umbrel/mdadm/mounts')
+		expect(mounts).not.toContain('/run/mdadm/umbrel-raid')
 	})
 
 	test('stopping the array removes it from the inventory', async () => {
-		await umbreld.client.hardware.mdadm.stop.mutate({arrayDevice: '/dev/md0'})
+		const device = await arrayDevice()
+		await umbreld.client.hardware.mdadm.stop.mutate({arrayDevice: device})
 
 		await pWaitFor(
 			async () => {
 				const status = await umbreld.client.hardware.mdadm.getStatus.query()
-				return status.arrays.every((array) => array.device !== '/dev/md0')
+				return status.arrays.every((array) => array.device !== device)
 			},
 			{interval: 1000, timeout: 30_000},
 		)
