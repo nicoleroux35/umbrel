@@ -821,8 +821,27 @@ export default class Mdadm {
 	async saveConfig({updateInitramfs = false}: {updateInitramfs?: boolean} = {}): Promise<void> {
 		try {
 			const {stdout} = await $`mdadm --detail --scan`
+			// `--detail --scan` names each array `/dev/md/<homehost>:<name>`, a devname
+			// mdadm itself refuses ("Value ... cannot be set as devname. Reason: Not
+			// POSIX compatible"), so every later read of the conf logs that warning and
+			// ignores the devname. Rewrite each line to the array's current numeric node,
+			// matched by UUID, which mdadm accepts.
+			const status = await this.getStatus()
+			const deviceByUuid = new Map(
+				status.arrays.filter((array) => array.uuid).map((array) => [array.uuid as string, array.device]),
+			)
+			const lines = stdout
+				.split('\n')
+				.map((line) => {
+					const uuid = line.match(/UUID=([0-9a-fA-F:]+)/)?.[1]
+					const device = uuid ? deviceByUuid.get(uuid) : undefined
+					if (!device) return line
+					return line.replace(/^(ARRAY\s+)\S+/, `$1${device}`)
+				})
+				.filter((line) => line.trim())
+			const conf = `HOMEHOST <system>\n${lines.join('\n')}\n`
 			await fse.ensureFile('/etc/mdadm/mdadm.conf')
-			await fse.writeFile('/etc/mdadm/mdadm.conf', `${stdout}\n`)
+			await fse.writeFile('/etc/mdadm/mdadm.conf', conf)
 			// Refreshing the initramfs is expensive (rebuilds every kernel image), so
 			// only do it when the set of arrays changes, not on every reshape.
 			if (updateInitramfs) {
