@@ -695,6 +695,34 @@ export async function createTestVm({
 		await $({env})`${vmScript} nvme move ${fromSlot} ${toSlot}`
 	}
 
+	async function addSas({slot, type, size}: {slot: number; type: 'hdd' | 'ssd'; size?: string}) {
+		if (size) {
+			await $({env})`${vmScript} sas add ${slot} --size ${size} --type ${type}`
+		} else {
+			await $({env})`${vmScript} sas add ${slot} --type ${type}`
+		}
+	}
+
+	async function addSasHdd({slot, size}: {slot: number; size?: string}) {
+		await addSas({slot, type: 'hdd', size})
+	}
+
+	async function addSasSsd({slot, size}: {slot: number; size?: string}) {
+		await addSas({slot, type: 'ssd', size})
+	}
+
+	async function removeSas({slot}: {slot: number}) {
+		await $({env})`${vmScript} sas destroy ${slot}`
+	}
+
+	async function disconnectSas({slot}: {slot: number}) {
+		await $({env})`${vmScript} sas disconnect ${slot}`
+	}
+
+	async function connectSas({slot}: {slot: number}) {
+		await $({env})`${vmScript} sas connect ${slot}`
+	}
+
 	async function reflash() {
 		await $({env})`${vmScript} reflash`
 	}
@@ -852,6 +880,12 @@ printf '\\n${authFailureMarker}\\n'
 		addHdd,
 		addSataSsd,
 		removeHdd,
+		addSas,
+		addSasHdd,
+		addSasSsd,
+		removeSas,
+		disconnectSas,
+		connectSas,
 		addUsbStorage,
 		removeUsbStorage,
 		disconnectUsbStorage,
