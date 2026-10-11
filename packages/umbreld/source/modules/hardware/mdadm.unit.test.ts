@@ -112,6 +112,25 @@ describe('mdadm detail parser', () => {
 `
 		expect(parseMdadmDetail(detail).state).toBe('degraded')
 	})
+
+	test('strips the homehost prefix and the "local to host" annotation mdadm 4.4 adds', () => {
+		// mdadm 4.4 (Debian 13) prints both when the array's homehost is the
+		// running host. Neither is part of the name, and the name becomes the
+		// mount directory, so both must go.
+		const detail = `/dev/md0:
+     Raid Level : raid1
+            Name : umbrel:umbrel-raid  (local to host umbrel)
+`
+		expect(parseMdadmDetail(detail).name).toBe('umbrel-raid')
+	})
+
+	test('strips a homehost prefix from a non-local array', () => {
+		const detail = `/dev/md0:
+     Raid Level : raid1
+            Name : otherhost:umbrel-raid
+`
+		expect(parseMdadmDetail(detail).name).toBe('umbrel-raid')
+	})
 })
 
 describe('mdadm level requirements', () => {

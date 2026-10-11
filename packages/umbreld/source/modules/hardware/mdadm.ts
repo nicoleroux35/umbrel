@@ -176,6 +176,27 @@ export function parseMdstat(mdstat: string): Array<{
 	return arrays
 }
 
+/**
+ * Strip the decoration mdadm puts around an array name in `--detail`.
+ *
+ * Metadata 1.2 prefixes the name with the homehost (`umbrel:umbrel-md`), and
+ * mdadm 4.4 — the version umbrelOS ships on Debian 13 — appends
+ * ` (local to host <hostname>)` when that homehost matches the running host:
+ *
+ *     Name : umbrel:umbrel-raid  (local to host umbrel)
+ *
+ * Neither part is the array name. The name becomes the mount directory under
+ * MOUNT_ROOT, so leaving them in produced paths like
+ * `/run/mdadm/umbrel-raid___local_to_host_umbrel_`.
+ */
+function normalizeArrayName(name?: string): string | undefined {
+	if (!name) return undefined
+	const withoutHostAnnotation = name.replace(/\s*\(local to host [^)]*\)\s*$/, '').trim()
+	if (!withoutHostAnnotation) return undefined
+	// A colon separates the homehost from the name; array names never contain one.
+	return withoutHostAnnotation.split(':').pop()?.trim() || undefined
+}
+
 export function parseMdadmDetail(detail: string): Partial<MdadmArray> {
 	const get = (re: RegExp): string | undefined => detail.match(re)?.[1]?.trim()
 	const raidLevel = get(/Raid Level\s*:\s*raid(\S+)/i) ?? get(/Raid Level\s*:\s*(\S+)/i)
@@ -193,7 +214,7 @@ export function parseMdadmDetail(detail: string): Partial<MdadmArray> {
 	else if (stateRaw.includes('clean')) state = 'clean'
 	else if (stateRaw.includes('active')) state = 'active'
 	const uuid = get(/UUID\s*:\s*([^\n]+)/)
-	const name = get(/Name\s*:\s*([^\n]+)/)
+	const name = normalizeArrayName(get(/Name\s*:\s*([^\n]+)/))
 	return {
 		level: raidLevel,
 		raidDevices: Number.isNaN(raidDevices) ? 0 : raidDevices,
